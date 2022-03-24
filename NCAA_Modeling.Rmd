@@ -1,0 +1,202 @@
+---
+title: "NCAA_Model"
+author: "Matthew Glittenberg"
+date: "3/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(zoo)
+library(mctest)
+library(car)
+# library(Boruta)
+```
+```{r Data Loading & Subsetting}
+data = read_csv("MRegularSeasonDetailedResults.csv") %>%
+  select(-c(WLoc, NumOT))
+
+names = c("Season", "Day", "TeamID", "Score", "FGM", "FGA", "3FGM", "3FGA", "FTM", "FTA",
+          "OR", "DR", "AST", "TO", "STL", "BLK", "PF", "Outcome")
+
+winners = data_sub %>%
+  select(c("Season", "DayNum", contains('W'))) %>%
+  mutate(
+    outcome = 1
+  )
+colnames(winners) = names
+
+losers = data_sub %>%
+  select(c("Season", "DayNum", contains('L'))) %>%
+  select(-c(WStl, WBlk)) %>%
+  mutate(
+    outcome = 0
+  )
+colnames(losers) = names
+
+cum_avg = function(x, gN) {cumsum(x) / gN}
+full_data = rbind(winners, losers) %>%
+  group_by(TeamID, Season) %>%
+  arrange(Season, Day) %>%
+  summarise(Outcome = as.factor(Outcome),
+                   gameNum = rank(Day),
+         across(c("Score", "FGM", "FGA", "3FGM", "3FGA",
+                  "FTM", "FTA", "OR", "DR", "AST", "TO",
+                  "STL", "BLK", "PF"), ~ cum_avg(.x, gameNum),
+                .names = "ca_{.col}"),
+         across(c("Score", "FGM", "FGA", "3FGM", "3FGA",
+                  "FTM", "FTA", "OR", "DR", "AST", "TO",
+                  "STL", "BLK", "PF"), 
+                ~ rollmean(.x, k = 5, fill = NA, 
+                           align = "right"),
+                .names = "ma_{.col}")) %>%
+  select(-c(gameNum))
+
+c_sort_collapse <- function(...){
+  c(...) %>% 
+    sort() %>% 
+    str_c(collapse = ".")
+}
+
+ca_data_list = full_data %>%
+  ungroup() %>%
+  select(starts_with("ca")) %>%
+  summarise(
+    across(everything(), list)) %>%
+    pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>%
+  expand(nesting(var, vector),
+         nesting(var2 = var, vector2 = vector)) %>%
+  filter(var != var2) %>%
+  arrange(var, var2) %>% 
+  mutate(vars = paste0(var, ".", var2)) %>% 
+  select(contains("var"), everything()) %>%
+  mutate(vars = map2_chr(.x = var, .y = var2,
+                         .f = c_sort_collapse)) %>%
+  distinct(vars, .keep_all = TRUE) %>%
+  mutate(pair_ratio = map2(vector, vector2, `/`),
+         pair_prod = map2(vector, vector2, `*`)) %>%
+  pivot_longer(cols = c(pair_ratio, pair_prod)) %>%
+  mutate(name_vars = str_c(var, name, var2, sep = ".")) %>%
+  select(name_vars, value) %>%
+  pivot_wider(values_from = value,
+              names_from = name_vars) %>%
+  unnest(cols = everything())
+         
+ma_data_list = full_data %>%
+  ungroup() %>%
+  select(starts_with("ma")) %>%
+  summarise(
+    across(everything(), list)) %>%
+    pivot_longer(cols = everything(), 
+               names_to = "var", 
+               values_to = "vector") %>%
+  expand(nesting(var, vector),
+         nesting(var2 = var, vector2 = vector)) %>%
+  filter(var != var2) %>%
+  arrange(var, var2) %>% 
+  mutate(vars = paste0(var, ".", var2)) %>% 
+  select(contains("var"), everything()) %>%
+  mutate(vars = map2_chr(.x = var, .y = var2,
+                         .f = c_sort_collapse)) %>%
+  distinct(vars, .keep_all = TRUE) %>%
+  mutate(pair_ratio = map2(vector, vector2, `/`),
+         pair_prod = map2(vector, vector2, `*`)) %>%
+  pivot_longer(cols = c(pair_ratio, pair_prod)) %>%
+  mutate(name_vars = str_c(var, name, var2, sep = ".")) %>%
+  select(name_vars, value) %>%
+  pivot_wider(values_from = value,
+              names_from = name_vars) %>%
+  unnest(cols = everything())
+         
+full_data_trans = full_data %>%
+  mutate(across(starts_with("ca"),
+                list(squared = ~ .x^2, sqrt = sqrt, log = log),
+                .names = "{.col}.{.fn}"),
+         across(starts_with("ma"),
+                list(squared = ~ .x^2, sqrt = sqrt, log = log),
+                .names = "{.col}.{.fn}"))
+
+full_data_list = cbind(full_data_trans,
+                       ca_data_list, 
+                       ma_data_list) %>%
+  drop_na() %>%
+  select(-c(inf_cols, ninf_cols))
+
+full_data_test = full_data_list %>%
+  filter(across(starts_with("ca")) >= 1)
+ 
+```
+```{r Feature Selection}
+data_sample = full_data_list %>%
+  ungroup() %>%
+  slice_sample(n = 10000, replace = TRUE)
+  mutate(Outcome = as.numeric(Outcome),
+         Outcome = case_when(Outcome == 2 ~ 1,
+                             Outcome == 1 ~ 0)
+         )
+
+#Remove Redundent Features
+cor_matrix = cor(data_sample[, 4:length(data_sample)])
+pcor_matrix = pcor(data_sample[, 4:length(data_sample)])
+ds_model = data_sample %>% dplyr::select(-c(TeamID, Season))
+model = glm(Outcome ~ .,
+             family="binomial",
+             data=ds_model)
+
+highcor = findCorrelation(cor_matrix, cutoff = 0.80, names = TRUE)
+
+ali = attributes(alias(model)$Complete)$dimnames[[1]]
+ali = attributes(alias(model, partial = TRUE)$Partial)$dimnames[[1]]
+
+ds_model2 = data_sample %>% 
+  dplyr::select(-c(TeamID, Season)) %>%
+  dplyr::select(-c(ali))
+
+ds_model3 = data_sample %>% 
+  dplyr::select(-c(TeamID, Season)) %>%
+  dplyr::select(-c(highcor))
+
+model2 = glm(Outcome ~ .,
+             family="binomial",
+             data=ds_model2)
+
+model3 = glm(Outcome ~ .,
+             family="binomial",
+             data=ds_model3)
+
+car::vif(model3)
+omcdiag(model)
+
+#Rank Features by Importance
+ctrl = trainControl(method="repeatedcv", number=10, repeats=3)
+
+model = train(Outcome~., 
+              data=as.data.frame(ds_model), method="lvq", 
+              preProcess = 'scale', trControl=ctrl)
+importance <- varImp(model)
+plot(importance)
+
+#Automatic Feature Selection
+control = rfeControl(functions = rfFuncs, method = 'cv', number = 10)
+results = rfe(data_sample[,2:15], data_sample$Outcome, 
+              sizes = c(1:14),  rfeControl = control)
+plot(results, type=c("g", "o"))
+pred = predictors(results)
+
+#Boruta
+# train_set2 = full_data %>%
+#   select(-c(TeamID))
+# boruta_output <- Boruta(Outcome ~ ., train_set2, doTrace=1)  
+# imps <- attStats(boruta_output)
+# imps2 = imps[imps$decision != 'Rejected', c('meanImp', 'decision')]
+# imps2[order(-imps2$meanImp), ]
+# plot(boruta_output, cex.axis=.7, las=2, xlab="", main="Variable Importance")
+```
+```{r}
+
+
+```
